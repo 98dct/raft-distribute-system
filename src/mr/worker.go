@@ -1,10 +1,16 @@
 package mr
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
+	"os"
+	"strconv"
+	"time"
+)
 import "log"
 import "net/rpc"
 import "hash/fnv"
-
 
 //
 // Map functions return a slice of KeyValue.
@@ -24,7 +30,6 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
 //
 // main/mrworker.go calls this function.
 //
@@ -32,10 +37,96 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	// Your worker implementation here.
+	//worker的作用：获取任务(map任务或者reduce任务)并执行任务
+loop:
+	for {
+		task := GetTask() //调用rpc向coordinator获取任务
+		if task == nil {
+			//没拉到任务,等待一会重新拉任务
+			time.Sleep(2 * time.Millisecond)
+			continue
+		}
+		switch task.TaskType {
+		case MapTask:
+			DoMapTask(mapf, task) //做map任务，将结果输出到文件中
+			callDone(task)        //通过rpc调用，在coordinator中将任务状态设置为已完成，便于协调者和工作者退出
+		//case ReduceTask:
+		//	DoReduceTask(reducef,task)
+		//	callDone()
+		case WaitingTask:
+			fmt.Println("所有任务都分发完了，please wait...")
+			time.Sleep(time.Second)
+		case ExitTask:
+			fmt.Println("task.Id:", task.TaskId, "is tertminated...")
+			break loop
+		}
+	}
 
 	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
+	//CallExample()
 
+}
+
+//向coordinator获取任务
+func GetTask() *Task {
+
+	args := TaskArgs{}
+	reply := Task{}
+
+	ok := call("coordinator.ProduceTask", &args, &reply)
+	if !ok {
+		fmt.Println("call failed\n")
+	}
+
+	return &reply
+}
+
+func DoMapTask(mapf func(string, string) []KeyValue, task *Task) {
+	var intermediate []KeyValue
+	fileName := task.FileName
+	file, err := os.Open(fileName)
+	defer file.Close()
+	if err != nil {
+		fmt.Printf("open file:%s failed:%v\n", task.FileName, err.Error())
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		fmt.Printf("read file:%s failed:%v\n", task.FileName, err.Error())
+	}
+
+	//返回一个文件的所有word的结构体切片  example:[{"aa":1,"bb":1,"AA":1}]
+	intermediate = mapf(fileName, string(content))
+
+	rn := task.ReduceNum
+
+	//创建一个长度为rn的二维切片
+	HashedKv := make([][]KeyValue, rn)
+	for _, kvStruct := range intermediate {
+		HashedKv[ihash(kvStruct.Key)%rn] = append(HashedKv[ihash(kvStruct.Key)%rn], kvStruct)
+	}
+
+	for i := 0; i < rn; i++ {
+		oname := "mr-tmp-" + strconv.Itoa(task.TaskId) + "-" + strconv.Itoa(i)
+		ofile, _ := os.Create(oname)
+
+		//json.NewEncoder(ofile).Encode(kv) 意思是将kv结构体数据以json的形式解析到ofile文件流中
+		encoder := json.NewEncoder(ofile)
+		for _, kvStruct := range HashedKv[i] {
+			encoder.Encode(kvStruct)
+		}
+		ofile.Close()
+	}
+}
+
+//调用rpc在协调者中将任务状态为设为已完成
+func callDone(task *Task) Task {
+	args := task
+	reply := Task{}
+	ok := call("coordinator.MarkFinished", &args, &reply)
+	if !ok {
+		fmt.Println("call failed")
+	}
+	return reply
 }
 
 //

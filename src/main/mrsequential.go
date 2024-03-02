@@ -66,6 +66,7 @@ func main() {
 	// and print the result to mr-out-0.
 	//
 	i := 0
+	var cnt int64
 	for i < len(intermediate) {
 		j := i + 1
 		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
@@ -79,9 +80,12 @@ func main() {
 
 		// this is the correct format for each line of Reduce output.
 		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+		cnt++
 
 		i = j
 	}
+
+	fmt.Printf("一共有%d个word", cnt)
 
 	ofile.Close()
 }
