@@ -120,7 +120,7 @@ type Raft struct {
 	overtime time.Duration //设置超时时间 200-400ms
 	timer    *time.Ticker  //每个节点的定时器
 
-	applyChan chan ApplyMsg
+	applyChan chan ApplyMsg //日志都是存在这里client取
 }
 
 type LogEntry struct {
@@ -132,10 +132,10 @@ type LogEntry struct {
 type AppendEntriesArgs struct {
 	Term         int        //leader的任期
 	LeaderId     int        //leader自身的ID
-	PrevLogIndex int        //预计从哪里追加index，因此每次比当前的len(logs)   rf.nextIndex[i]-1
-	PrevLogTerm  int        //预计新的日志的任期号（当前leader的任期号）  rf.currentTerm
+	PrevLogIndex int        //预计从哪里追加index，因此每次比当前的len(logs)多1  初始化为rf.nextIndex[i]-1
+	PrevLogTerm  int        //追加新的日志的任期号（当前leader的任期号）  rf.currentTerm
 	Entries      []LogEntry //存储的日志  为空时就是心跳
-	LeaderCommit int        //
+	LeaderCommit int        //leader的commit index指的是最后一个被大多数机器都复制的日志index
 }
 
 type AppendEntriesReply struct {
@@ -237,9 +237,84 @@ type RequestVoteReply struct {
 
 //
 // example RequestVote RPC handler.
+// 个人认为定时刷新的地方应该是别的节点与当前的节点在数据上不冲突的时候就要刷新
+// 因为如果不是数据冲突那么定时相当于防止自身去选举的一个心跳
+// 如果是因为数据冲突，那么这个节点不用刷新定时是为了当前整个raft能尽快有个正确的leader
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	//当前节点crash
+	if rf.killed() {
+		reply.VoteState = Killed
+		reply.Term = -1
+		reply.VoteGranted = false
+		return
+	}
+
+	//出现网络分区，该竞选者已经OutOfDate(过时)
+	if args.Term < rf.currentTerm {
+		reply.VoteState = Expire
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return
+	}
+
+	if args.Term > rf.currentTerm {
+		//重置自身的状态
+		rf.status = Follower
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+	}
+
+	// 此时比自己任期小的都已经把票还原
+	if rf.votedFor == -1 {
+
+		currentLogIndex := len(rf.logs) - 1
+		currentLogTerm := 0
+		//如果currentLogIndex下标不是-1就把term赋值过来
+		if currentLogIndex >= 0 {
+			currentLogTerm = rf.logs[currentLogIndex].Term
+		}
+
+		//论文中第二个匹配条件，当前的peer要复合arg两个参数的预期
+		if args.LastLogIndex < currentLogIndex || args.LastLogTerm < currentLogTerm {
+			reply.VoteState = Expire
+			reply.VoteGranted = false
+			reply.Term = rf.currentTerm
+			return
+		}
+
+		//投票
+		rf.votedFor = args.CandidateId
+
+		reply.VoteState = Normal
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = true
+
+		rf.timer.Reset(rf.overtime)
+	} else {
+		// 只剩下任期相同，但是票已经给了，此时存在两种情况
+		reply.VoteState = Voted
+		reply.VoteGranted = false
+
+		// 1.当前的节点来自同一轮，不同竞选者，但是票数已经给了
+		if rf.votedFor != args.CandidateId {
+			//告诉reply票已经没了，返回false
+			return
+		} else { //2.当前节点的票已经给同一个人了，但是由于sleep等网络原因，又发送了一次请求
+			//重置自身的状态
+			rf.status = Follower
+		}
+
+		rf.timer.Reset(rf.overtime)
+
+	}
+
+	return
+
 }
 
 //
@@ -279,7 +354,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 
-	if !ok {
+	for !ok {
 		//失败重传
 		if rf.killed() {
 			return false
@@ -298,7 +373,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	switch reply.VoteState {
 	//消息过期的两种情况
 	//1.本身的term过期了比节点还小
-	//2.节点的日志的条目落后于节点了
+	//2.请求投票的节点的日志的条目落后于被要求投票的节点了
 	case Expire:
 		rf.status = Follower
 		rf.timer.Reset(rf.overtime)
@@ -307,10 +382,29 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 			rf.votedFor = -1
 		}
 	case Normal, Voted:
-		if reply.VoteGranted && reply.Term == rf.currentTerm && *voteNums <= len(rf.peers) {
+		if reply.VoteGranted && reply.Term == rf.currentTerm && *voteNums <= (len(rf.peers)/2) {
 			*voteNums++
 		}
 
+		//票数超一半
+		if *voteNums >= (len(rf.peers)/2)+1 {
+
+			*voteNums = 0
+			//本身就是leader在网络分区中更具有话语权的leader
+			if rf.status == Leader {
+				return ok
+			}
+
+			//本身不是leader，那么需要初始化nextIndex数组
+			rf.status = Leader
+			rf.nextIndex = make([]int, len(rf.peers))
+			for i, _ := range rf.nextIndex {
+				rf.nextIndex[i] = len(rf.logs) + 1
+			}
+			rf.timer.Reset(HeartBeatTimeout)
+		}
+	case Killed:
+		return false
 	}
 
 	return ok
@@ -354,6 +448,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	rf.mu.Lock()
+	rf.timer.Stop()
+	rf.mu.Unlock()
 }
 
 func (rf *Raft) killed() bool {
@@ -381,7 +478,7 @@ func (rf *Raft) ticker() {
 				fallthrough
 
 			case Candidate:
-				//初始化自身的女任期，并把票投给自己
+				//初始化自身的任期，并把票投给自己
 				rf.currentTerm += 1
 				rf.votedFor = rf.me
 				votedNums := 1 //统计自身的票数
@@ -410,10 +507,99 @@ func (rf *Raft) ticker() {
 					go rf.sendRequestVote(i, &voteArgs, &voteReply, &votedNums)
 
 				}
+			case Leader:
+				//进行心跳和日志同步
+				appendNums := 1 //对于正确返回的节点数量
+				rf.timer.Reset(HeartBeatTimeout)
+				//构造msg
+				for i := 0; i < len(rf.peers); i++ {
+					if i == rf.me {
+						continue
+					}
+					appendEntriesArgs := AppendEntriesArgs{
+						Term:         rf.currentTerm,
+						LeaderId:     rf.me,
+						PrevLogIndex: 0,
+						PrevLogTerm:  0,
+						Entries:      nil,
+						LeaderCommit: rf.commitIndex,
+					}
+
+					appendEntriesReply := AppendEntriesReply{}
+					go rf.sendAppendEntries(i, &appendEntriesArgs, &appendEntriesReply, &appendNums)
+
+				}
 			}
+
+			rf.mu.Unlock()
 		}
 
 	}
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply, appendNums *int) bool {
+	if rf.killed() {
+		return false
+	}
+
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	for !ok {
+		if rf.killed() {
+			return false
+		}
+		ok = rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	}
+
+	//必须加在这里，否则加在前面retry进入时，RPC也需要一个锁，但是又获取不到
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	//对reply的返回状态进行分支
+	switch reply.AppState {
+
+	//目标节点crash
+	case AppKilled:
+		return false
+
+	//目标节点正常返回
+	case AppNormal:
+		//2A的test目的是让leader能不能连续任期，所以2A只需要对节点初始化返回即可
+		return true
+	//出现网络分区，该leader已经OutOfDate
+	case AppOutOfDate:
+		//该节点变成追随者，并重置rf状态
+		rf.status = Follower
+		rf.votedFor = -1
+		rf.timer.Reset(rf.overtime)
+		rf.currentTerm = reply.Term
+	}
+
+	return ok
+}
+
+// AppendEntries 建立心跳、同步日志RPC
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	//节点crash
+	if rf.killed() {
+		reply.AppState = AppKilled
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		return
+	}
+
+	//对当前的rf进行ticker重置
+	rf.currentTerm = args.Term
+	rf.votedFor = args.LeaderId
+	rf.status = Follower
+	rf.timer.Reset(rf.overtime)
+
+	//对返回的reply进行赋值
+	reply.AppState = AppNormal
+	reply.Term = rf.currentTerm
+	reply.Success = true
+	return
 }
 
 //
