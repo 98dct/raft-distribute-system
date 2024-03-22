@@ -108,10 +108,13 @@ type Raft struct {
 
 	//所有的servers经常修改的：
 	//正常情况下commitIndex和lastApplied应该是一致的，但是如果有一个新的提交，但是还未被应用的话，lastApplied应该要小一点
-	commitIndex int //状态机中已知的被提交的日志条目的索引值（0---n）
+	commitIndex int //状态机中已知的被提交的日志条目的索引值 初始化为0，持续递增（0---n）
 	lastApplied int //最后一个被追加到状态机日志的索引值
 
-	//leader拥有的可见变量
+	//leader拥有的可见变量，用来管理他的follower
+	//nextIndex与matchIndex初始化长度应该为len(peers),leader对于每个follower都记录它的nextIndex和matchIndex
+	//nextIndex指的是下一个appendEntries要从哪里开始
+	//matchIndex值的是已知的某follower的log与leader的log最大匹配到第几个index，已经apply
 	nextIndex  []int //对于每一个server，需要发送给他下一个日志条目的索引值（初始化为leader日志index+1,那么范围就对标len）
 	matchIndex []int //对于每一个server，已经复制给该server的最后日志条目下标
 
@@ -148,8 +151,19 @@ type AppendEntriesReply struct {
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	var term int
 	var isleader bool
+
+	term = rf.currentTerm
+	if rf.status == Leader {
+		isleader = true
+	} else {
+		isleader = false
+	}
+
 	// Your code here (2A).
 	return term, isleader
 }
