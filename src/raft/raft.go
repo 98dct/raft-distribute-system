@@ -426,6 +426,28 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	if rf.killed() {
+		return index, term, false
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	//如果不是leader,直接返回
+	if rf.status != Leader {
+		return index, term, false
+	}
+
+	isLeader = true
+
+	//初始化日志条目，并进行追加
+	appendLog := LogEntry{
+		Term:    rf.currentTerm,
+		Command: command,
+	}
+	rf.logs = append(rf.logs, appendLog)
+	index = len(rf.logs)
+	term = rf.currentTerm
 
 	return index, term, isLeader
 }
